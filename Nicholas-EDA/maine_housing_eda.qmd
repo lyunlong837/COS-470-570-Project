@@ -1,0 +1,641 @@
+---
+title: "Maine permitting EDA and initial modeling"
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-depth: 2
+    code-fold: true
+    code-summary: "Show code"
+    number-sections: false
+    fig-width: 8
+    fig-height: 4.4
+    df-print: default
+execute:
+  echo: true
+  warning: false
+  message: false
+  cache: false
+editor:
+  markdown:
+    wrap: sentence
+---
+
+::: {.callout-tip title="The 30-second version"}
+**2025 housing permits** were compared across Maine communities to see whether income, population density, population change, and seasonal housing help explain where new homes are being permitted.
+
+**Findings:** Some patterns looked significant statewide, but were less convincing when we accounted for county or removed very small communities.
+**Location and community size matter**, and a statistical relationship is not necessarily a cause.
+:::
+
+## 1. The question to answer
+
+**Why do some Maine communities permit more housing than others?**
+
+Four possible explanations to explore: income, population growth, population density, and seasonal housing.
+
+Our data has to do with permitted housing units, not homes that have already been built.
+It is also a snapshot of one year, so we are likely going to be describing associations, rather than proving what causes construction.
+
+## 2. Some data sources
+
+| Source | What it gives us | Why we need it |
+|:-----------------------|:-----------------------|:-----------------------|
+| 2025 Maine housing permit workbook | Number of permitted units | The outcome we want to explain |
+| 2020–2024 American Community Survey (ACS) | Population, income, housing stock, seasonal vacancies | Characteristics of each community |
+| 2015–2019 ACS | Earlier population estimate | An approximate population-change measure |
+| Census geographic data | Land area | Population density |
+
+**Before running this:** Put `2025 Statewide Housing Data.xlsx` beside this `.qmd`.
+Install the packages in the next code block once, and configure your Census API key in your R environment.
+
+```{r}
+library(tidyverse)
+library(tidycensus)
+library(readxl)
+library(MASS)
+library(DHARMa)
+library(glmmTMB)
+library(tigris)
+library(sf)
+
+options(tigris_use_cache = TRUE)
+permit_file <- "2025 Statewide Housing Data.xlsx"
+if (!file.exists(permit_file)) {
+  stop("Place '2025 Statewide Housing Data.xlsx' beside the .qmd, or edit permit_file.")
+}
+if (!nzchar(Sys.getenv("CENSUS_API_KEY"))) {
+  message("Census API key not found in CENSUS_API_KEY; Census queries may be limited.")
+}
+```
+
+```{r}
+maine_acs <- get_acs(
+  geography = "county subdivision",
+  state = "ME",
+  year = 2024,
+  survey = "acs5",
+  variables = c(
+    population = "B01003_001",
+    median_income = "B19013_001",
+    housing_units = "B25001_001"
+  ),
+  output = "wide"
+)
+
+maine_acs_clean <- maine_acs |>
+  transmute(
+    geoid = GEOID,
+    municipality = NAME,
+    population = populationE,
+    median_income = median_incomeE,
+    housing_units = housing_unitsE
+  ) |>
+  mutate(
+    median_income = if_else(
+      median_income < 0,
+      NA_real_,
+      median_income
+    )
+  )
+
+permits <- read_excel(permit_file, sheet = "Combined BP Only")
+```
+
+## 3. Joining datasets
+
+The permit file and Census data don't use identical town names, so we can standardize town and county names before joining them.
+
+Not every place matched, and not every town reported a permit count.
+A permit count of zero means no permits were reported, while a missing permit count means we don't know the count.
+
+The duplicate check below confirms that neither dataset contains repeated town–county keys.
+That helps prevent accidental double-counting during the join.
+
+```{r}
+# Standardize the Census names
+census_match <- maine_acs_clean |>
+  mutate(
+    geoid = as.character(geoid),
+
+    county = str_extract(
+      municipality,
+      "(?<=, ).+(?= County, Maine$)"
+    ) |>
+      str_to_upper(),
+
+    town = str_remove(
+      municipality,
+      ", .*"
+    ) |>
+      str_remove(" (city|town)$") |>
+      str_to_upper()
+  )
+
+# Standardize the permit names
+permits_match <- permits |>
+  filter(
+    !is.na(TOWN),
+    str_to_upper(str_trim(TOWN)) != "TOTAL"
+  ) |>
+  mutate(
+    town = str_to_upper(str_squish(TOWN)),
+    county = str_to_upper(str_squish(COUNTY))
+  )
+
+census_duplicates <- census_match |>
+  count(town, county) |>
+  filter(n > 1)
+
+permit_duplicates <- permits_match |>
+  count(town, county) |>
+  filter(n > 1)
+
+# Display a human-readable quality check, not two empty data frames.
+cat("Duplicate town–county combinations: Census =",
+    nrow(census_duplicates), "; permits =", nrow(permit_duplicates), "\n")
+
+maine_combined <- permits_match |>
+  left_join(
+    census_match,
+    by = c("town", "county"),
+    relationship = "many-to-one"
+  )
+```
+
+```{r}
+maine_combined <- maine_combined |>
+  mutate(
+    permit_status = case_when(
+      is.na(BP_Total) ~ "Missing",
+      BP_Total == 0 ~ "Zero permits",
+      BP_Total > 0 ~ "Positive permits"
+    )
+  )
+
+# Keep a compact summary rather than printing wide county/source tables.
+maine_combined |>
+  summarise(
+    matched = sum(!is.na(geoid)),
+    unmatched = sum(is.na(geoid)),
+    missing_permit_counts = sum(is.na(BP_Total)),
+    reported_zero_permits = sum(BP_Total == 0, na.rm = TRUE)
+  ) |>
+  knitr::kable(caption = "Data matching and reporting overview")
+
+maine_combined |>
+  filter(!is.na(geoid)) |>
+  ggplot(aes(
+    x = county,
+    fill = permit_status
+  )) +
+  geom_bar(position = "fill") +
+  coord_flip() +
+  scale_y_continuous(
+    labels = scales::label_percent()
+  ) +
+  labs(
+    title = "Permit data availability by Maine county",
+    x = "County",
+    y = "Proportion of county subdivisions",
+    fill = "Permit status"
+  )
+```
+
+```{r}
+maine_analysis <- maine_combined |>
+  filter(
+    !is.na(geoid),
+    !is.na(BP_Total),
+    !is.na(housing_units),
+    housing_units > 0
+  ) |>
+  mutate(
+    permits_per_1000_homes =
+      BP_Total / housing_units * 1000,
+
+    permits_per_1000_people = if_else(
+      population > 0,
+      BP_Total / population * 1000,
+      NA_real_
+    )
+  )
+
+maine_analysis |>
+  summarise(
+    `Communities with reported permits` = n(),
+    `Median permits per 1,000 homes` = round(median(permits_per_1000_homes), 1),
+    `Communities with zero permits` = sum(BP_Total == 0)
+  ) |>
+  knitr::kable(caption = "The analysis sample at a glance")
+```
+
+### Which counties have missing information?
+
+Missing permit reports are not spread evenly across Maine, which limits how confidently we can generalize our results to every municipality.
+
+## 4. Comparing communities fairly
+
+A large city can issue more permits than a small town because it has more homes.
+So we should start with a rate:
+
+$$
+\text{Permits per 1,000 homes} = \frac{\text{Permitted units}}{\text{Existing housing units}}\times 1{,}000
+$$
+
+This makes the plots easier to compare.
+In our regression models, we can use the permit count with an offset for existing housing units instead of directly modeling the rate.
+
+```{r}
+maine_analysis |>
+  ggplot(aes(x = permits_per_1000_homes)) +
+  geom_histogram(
+    bins = 40,
+    color = "white"
+  ) +
+  labs(
+    title = "Distribution of housing construction rates in Maine",
+    x = "Permitted housing units per 1,000 existing homes",
+    y = "Number of municipalities"
+  )
+```
+
+Many communities have modest permitting rates, while a few have very high rates.
+Tiny communities can have dramatic rates even when they issue only a handful of permits.
+
+## 5. Changing statistical models
+
+The model used became more complex as issues came up:
+
+| Model | Explanation | Issue |
+|:-----------------------|:-----------------------|:-----------------------|
+| Linear regression | Draw a line through permit *rates* | Rates were skewed, with extreme outliers |
+| Poisson regression | Model the number of permits | The data varied much more than Poisson expected |
+| Negative binomial | Allow extra variability in counts | Still predicted too few zero-permit communities |
+
+**Finally, Zero-inflated negative binomial (ZINB) was chosen** for model counts and an additional chance of zero.
+An offset tells the count model how many existing homes a community has, so the comparison is effectively about permits relative to housing stock.
+
+### A quick look at income
+
+An initial hypothesis was that higher-income places might permit more housing.
+This scatterplot shows the raw relationship before adjusting for other variables.
+
+```{r}
+maine_analysis |>
+  filter(!is.na(median_income)) |>
+  ggplot(aes(median_income, permits_per_1000_homes)) +
+  geom_point(alpha = 0.35, color = "#31708e") +
+  geom_smooth(method = "lm", se = FALSE, color = "#cc6b42") +
+  labs(title = "Income alone doesn't explain much of the variation",
+       x = "Median household income ($)",
+       y = "Permits per 1,000 existing homes") +
+  theme_minimal(base_size = 12)
+```
+
+### Checking the count models
+
+The following code fits the simpler count models and checks why a more flexible model is appropriate.
+Open the code if you'd like to see the progression.
+
+```{r}
+model_data <- maine_analysis |>
+  filter(!is.na(median_income)) |>
+  mutate(income_10k = median_income / 10000)
+
+model_ols <- lm(permits_per_1000_homes ~ income_10k, data = model_data)
+model_poisson <- glm(BP_Total ~ income_10k + offset(log(housing_units)),
+                     family = poisson(), data = model_data)
+model_nb_income <- MASS::glm.nb(BP_Total ~ income_10k +
+                                offset(log(housing_units)), data = model_data)
+
+# Values far above 1 indicate that Poisson understates variability.
+pearson_dispersion <- sum(residuals(model_poisson, type = "pearson")^2) /
+  df.residual(model_poisson)
+
+tibble(
+  check = c("Linear model R-squared", "Poisson dispersion ratio"),
+  value = c(summary(model_ols)$r.squared, pearson_dispersion)
+) |>
+  mutate(value = round(value, 3))
+```
+
+## 6. Testing more explanations
+
+**Population density** and an approximate measure of **population change** may influence the analysis.
+
+The population-change measure compares two ACS five-year estimates.
+It is not an exact 2019-to-2024 population count, and it can be noisy for tiny places.
+
+```{r}
+maine_acs_2019 <- get_acs(
+  geography = "county subdivision",
+  state = "ME",
+  year = 2019,
+  survey = "acs5",
+  variables = c(population = "B01003_001"),
+  output = "wide"
+)
+maine_pop_2019 <- maine_acs_2019 |>
+  transmute(
+    geoid = as.character(GEOID),
+    population_2019_acs = populationE
+  )
+
+maine_geography <- tigris::county_subdivisions(
+  state = "ME", year = 2024, cb = TRUE
+)
+maine_density <- maine_geography |>
+  sf::st_drop_geometry() |>
+  transmute(
+    geoid = as.character(GEOID),
+    land_area_sqmi = ALAND / 2589988.11
+  )
+
+maine_analysis <- maine_analysis |>
+  left_join(maine_pop_2019, by = "geoid", relationship = "many-to-one") |>
+  left_join(maine_density, by = "geoid", relationship = "many-to-one") |>
+  mutate(
+    population_growth_acs = if_else(
+      population_2019_acs > 0,
+      (population - population_2019_acs) / population_2019_acs * 100,
+      NA_real_
+    ),
+    population_density = if_else(
+      land_area_sqmi > 0,
+      population / land_area_sqmi,
+      NA_real_
+    )
+  )
+```
+
+### Maine's seasonal housing question
+
+Maybe places with more seasonal homes issue more permits.
+Our measure is the ACS share of housing units classified as **vacant for seasonal, recreational, or occasional use**—not every second home.
+
+```{r}
+maine_seasonal <- get_acs(
+  geography = "county subdivision",
+  state = "ME",
+  year = 2024,
+  survey = "acs5",
+  variables = c(
+    seasonal_units = "B25004_006"
+  ),
+  output = "wide"
+)
+
+maine_seasonal_clean <- maine_seasonal |>
+  transmute(
+    geoid = as.character(GEOID),
+    seasonal_units = seasonal_unitsE
+  ) |>
+  mutate(
+    seasonal_units = if_else(
+      seasonal_units < 0,
+      NA_real_,
+      seasonal_units
+    )
+  )
+
+maine_analysis <- maine_analysis |>
+  left_join(
+    maine_seasonal_clean,
+    by = "geoid",
+    relationship = "many-to-one"
+  ) |>
+  mutate(
+    seasonal_share_pct = if_else(
+      housing_units > 0,
+      seasonal_units / housing_units * 100,
+      NA_real_
+    )
+  )
+```
+
+```{r}
+maine_analysis |>
+  filter(!is.na(seasonal_share_pct)) |>
+  ggplot(aes(seasonal_share_pct, permits_per_1000_homes)) +
+  geom_point(alpha = 0.35, color = "#31708e") +
+  geom_smooth(method = "loess", se = FALSE, color = "#cc6b42") +
+  labs(title = "Is more seasonal housing linked to more permits?",
+       x = "Seasonal-vacancy share of housing units (%)",
+       y = "Permits per 1,000 existing homes") +
+  theme_minimal(base_size = 12)
+```
+
+## 7. Putting it all together
+
+Now we can fit models that consider several characteristics at the same time to see if income, density, seasonal housing, and location may be related to one another.
+
+We use the same set of 421 complete cases for the main comparisons.
+The ZINB models include an extra-zero component based on housing stock.
+
+```{r}
+model_data_seasonal <- maine_analysis |>
+  filter(!is.na(median_income),
+         !is.na(population_growth_acs),
+         !is.na(population_density), population_density > 0,
+         !is.na(seasonal_share_pct), housing_units > 0) |>
+  mutate(income_10k = median_income / 10000,
+         log_density = log(population_density),
+         seasonal_share_10pct = seasonal_share_pct / 10)
+
+model_zinb_seasonal <- glmmTMB::glmmTMB(
+  BP_Total ~ income_10k + population_growth_acs + log_density +
+    seasonal_share_10pct + offset(log(housing_units)),
+  ziformula = ~ log(housing_units),
+  family = glmmTMB::nbinom2(), data = model_data_seasonal
+)
+
+model_zinb_no_growth <- glmmTMB::glmmTMB(
+  BP_Total ~ income_10k + log_density + seasonal_share_10pct +
+    offset(log(housing_units)),
+  ziformula = ~ log(housing_units),
+  family = glmmTMB::nbinom2(), data = model_data_seasonal
+)
+
+model_zinb_county <- glmmTMB::glmmTMB(
+  BP_Total ~ income_10k + log_density + seasonal_share_10pct +
+    factor(county) + offset(log(housing_units)),
+  ziformula = ~ log(housing_units),
+  family = glmmTMB::nbinom2(), data = model_data_seasonal
+)
+
+model_zinb_county_no_seasonal <- glmmTMB::glmmTMB(
+  BP_Total ~ income_10k + log_density + factor(county) +
+    offset(log(housing_units)),
+  ziformula = ~ log(housing_units),
+  family = glmmTMB::nbinom2(), data = model_data_seasonal
+)
+
+tibble(
+  `Model` = c("Statewide: income + density + seasonal housing",
+              "Add county",
+              "County model without seasonal housing"),
+  `AIC` = round(c(AIC(model_zinb_no_growth),
+                  AIC(model_zinb_county),
+                  AIC(model_zinb_county_no_seasonal)), 1)
+) |>
+  knitr::kable(caption = "Lower AIC indicates better fit–complexity tradeoff")
+```
+
+::: {.callout-note title="How to read AIC"}
+**Lower AIC is better when models use the same observations.** AIC rewards fit but penalizes complexity.
+It doesn't tell us whether a relationship is causal, or whether the model is perfect.
+:::
+
+## 8. County changes things
+
+At first, seasonal housing had a positive, statistically significant association with permits.
+But after adding county, that association became smaller and was no longer statistically significant.
+
+The county model without seasonal housing was slightly preferred by AIC, and adding seasonal housing did not significantly improve fit (likelihood-ratio test, $p=0.357$).
+
+This suggests that some of the apparent statewide seasonal-housing relationship may reflect differences between counties, rather than a consistent pattern within counties.
+
+A statewide pattern can look different once we compare communities in the same county.
+
+```{r}
+seasonal_lrt <- anova(model_zinb_county_no_seasonal, model_zinb_county)
+# Store the formal comparison without printing its wide technical table.
+stopifnot(nrow(seasonal_lrt) == 2)
+```
+
+## 9. Does the conclusion change for larger communities?
+
+Very small towns can produce unstable rates, so repeating the county-controlled model using only places with **at least 500 existing housing units** could change our results.
+
+```{r}
+model_zinb_county_500 <- glmmTMB::glmmTMB(
+  BP_Total ~
+    income_10k +
+    log_density +
+    factor(county) +
+    offset(log(housing_units)),
+  ziformula = ~ log(housing_units),
+  family = glmmTMB::nbinom2(),
+  data = model_data_seasonal |>
+    filter(housing_units >= 500)
+)
+
+# Keep the full model output available in the R object; show a short
+# comparison table below instead of printing every county coefficient.
+```
+
+```{r}
+#| label: fig-coefficient-comparison
+#| fig-cap: "Estimated count-model coefficients and 95% confidence intervals. Compare each predictor across samples, not income with density."
+#| fig-height: 4.5
+# Extract estimates and uncertainty from both models.
+extract_terms <- function(model, sample) {
+  co <- summary(model)$coefficients$cond
+  tibble(
+    sample = sample,
+    predictor = rownames(co),
+    estimate = co[, "Estimate"],
+    se = co[, "Std. Error"],
+    p = co[, "Pr(>|z|)"]
+  ) |>
+    filter(predictor %in% c("income_10k", "log_density")) |>
+    mutate(
+      lower = estimate - 1.96 * se,
+      upper = estimate + 1.96 * se,
+      predictor = recode(predictor,
+                         income_10k = "Income (per $10,000)",
+                         log_density = "Log population density")
+    )
+}
+
+coefficient_comparison <- bind_rows(
+  extract_terms(model_zinb_county_no_seasonal, "All 421 communities"),
+  extract_terms(model_zinb_county_500, "297 communities (500+ homes)")
+)
+
+coefficient_comparison |>
+  ggplot(aes(x = estimate, y = sample, color = sample)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey55") +
+  geom_errorbarh(aes(xmin = lower, xmax = upper), height = 0.15) +
+  geom_point(size = 2.8) +
+  facet_wrap(~ predictor, scales = "free_x", ncol = 1) +
+  labs(x = "Estimated coefficient (95% confidence interval)", y = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "none")
+```
+
+```{r}
+coefficient_comparison |>
+  transmute(
+    `Sample` = sample,
+    `Predictor` = predictor,
+    `Coefficient` = sprintf("%.3f", estimate),
+    `p-value` = if_else(p < 0.001, "<0.001", sprintf("%.3f", p))
+  ) |>
+  knitr::kable(caption = "Sensitivity analysis: correctly formatted p-values")
+```
+
+**What changed?** In the full county-controlled sample, density had a negative coefficient while income was not significant at the 5% level.
+Among communities with 500+ homes, income became statistically significant and the density coefficient became much smaller and was not significant.
+We should be cautious about sweeping claims based on one sample definition.
+
+Important: We do not compare AIC between these two models because they were fitted to different sets of communities.
+
+## 10. Do the model diagnostics look reasonable?
+
+A model can have interesting coefficients and still fit poorly.
+DHARMa simulations can check whether the model produces roughly the amount of variability and the number of zeros we observe.
+
+```{r}
+#| label: fig-final-residuals
+#| fig-cap: "Simulation-based residual checks for the county-controlled model. The outlier test in the QQ plot flags an issue even though dispersion and zero-count checks are not significant."
+#| fig-height: 4
+set.seed(470)
+res_final <- DHARMa::simulateResiduals(
+  model_zinb_county_no_seasonal, n = 1000
+)
+
+# One diagnostic figure; avoid additional redundant test histograms.
+plot(res_final, quantreg = FALSE)
+```
+
+```{r}
+#| label: tbl-diagnostics
+# Calculate tests without printing long console output.
+dispersion_test <- DHARMa::testDispersion(res_final, plot = FALSE)
+zero_test <- DHARMa::testZeroInflation(res_final, plot = FALSE)
+outlier_test <- DHARMa::testOutliers(res_final, plot = FALSE)
+
+tibble(
+  `Check` = c("Dispersion", "Excess zeros", "Outliers"),
+  `p-value` = c(dispersion_test$p.value,
+                zero_test$p.value,
+                outlier_test$p.value)
+) |>
+  mutate(`p-value` = if_else(`p-value` < 0.001,
+                             "<0.001", sprintf("%.3f", `p-value`))) |>
+  knitr::kable(caption = "DHARMa checks (p-values may vary slightly by simulation)")
+```
+
+**How to interpret these results:** In our original session, the county model converged, and neither the dispersion test ($p=0.166$) nor the zero-inflation test ($p=0.648$) detected a significant discrepancy.
+**But the residual QQ plot flagged an outlier issue (**$p\approx0.02$).
+Some communities are more extreme than the model predicts.
+
+## 11. What can we take away from this?
+
+::: {.callout-tip title="Main takeaways"}
+1.  **County matters.** Accounting for county improved the statewide model and changed the apparent income and seasonal-housing relationships.
+2.  **Income may matter more in larger communities.** It had a positive association in the 500+ housing-unit county-controlled sample.
+3.  **Density is sensitive to the sample.** Its negative association weakened when we excluded small communities.
+4.  **Seasonal housing was interesting, but not robust to county controls.** It should be presented as an exploratory finding, not a proven driver of construction.
+5.  **Diagnostics are mixed.** Dispersion and zero counts look reasonable, but the outlier check flags a remaining limitation.
+:::
+
+### What we cannot conclude
+
+- **Not causation:** We cannot say income, density, or seasonal housing *caused* more permits.
+- **Not all of Maine:** Some permit observations are missing, and missingness varies by county.
+- **Not completed homes:** A permit is permission to build, not a completed housing unit.
+- **Not perfectly measured:** ACS values are estimates, especially uncertain in tiny communities.
+- **Not necessarily consistent reporting:** Permit records combine Census and local data sources.
