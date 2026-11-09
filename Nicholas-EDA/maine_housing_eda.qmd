@@ -49,6 +49,19 @@ It is also a snapshot of one year, so we are likely going to be describing assoc
 **Before running this:** Put `2025 Statewide Housing Data.xlsx` beside this `.qmd`.
 Install the packages in the next code block once, and configure your Census API key in your R environment.
 
+### Census API Key Setup
+
+To run this analysis, you'll need a free U.S. Census API key.
+
+1. Request a key at [Census API Key Signup](https://api.census.gov/data/key_signup.html).
+2. Once you receive your key by email, run the following in your **RStudio Console**:
+
+`tidycensus::census_api_key("YOUR_API_KEY", install = TRUE)`
+
+3. Restart RStudio. Your key will be saved locally and automatically loaded for future sessions.
+
+You only need to do this once per computer. 
+
 ```{r}
 library(tidyverse)
 library(tidycensus)
