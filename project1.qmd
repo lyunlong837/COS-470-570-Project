@@ -1,0 +1,468 @@
+---
+title: "What Predicts Where Maine Builds?"
+subtitle: "Municipal characteristics and the geography of housing permits"
+author: "CS 570 -- Project 1"
+format:
+  pdf:
+    documentclass: article
+    papersize: letter
+    geometry:
+      - top=0.9in
+      - bottom=0.9in
+      - left=0.95in
+      - right=0.95in
+    fontsize: 10pt
+    linestretch: 1.05
+    number-sections: true
+    fig-cap-location: bottom
+    tbl-cap-location: top
+    fig-pos: "H"
+    include-in-header:
+      text: |
+        \usepackage{float}
+        \usepackage{booktabs}
+        \usepackage{array}
+        \usepackage{makecell}
+        \usepackage{caption}
+        \usepackage{microtype}
+        \setlength{\parskip}{3pt}
+        \setlength{\parindent}{0pt}
+        \captionsetup{font=small,labelfont=bf}
+execute:
+  echo: false
+  warning: false
+  message: false
+  cache: false
+---
+
+```{r setup}
+#| include: false
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr); library(ggplot2); library(patchwork)
+  library(scales); library(knitr); library(kableExtra); library(tidymodels)
+  library(forcats); library(stringr); library(readr); library(tibble)
+})
+source("R/data_prep.R")
+source("R/models.R")
+
+theme_set(
+  theme_bw(base_size = 9) +
+    theme(panel.grid.minor = element_blank(),
+          legend.position = "bottom",
+          legend.title = element_blank(),
+          plot.title = element_text(size = 9, face = "bold"),
+          plot.margin = margin(4, 6, 2, 2))
+)
+
+fmt <- function(x, d = 2) formatC(x, format = "f", digits = d)
+
+housing <- prepare_housing_data()
+d       <- housing$modelled
+reg     <- get_model_results(d, "regression")
+clf     <- get_model_results(d, "classification")
+
+m_reg  <- reg$metrics |> select(model, .metric, mean) |>
+  pivot_wider(names_from = .metric, values_from = mean)
+se_reg <- reg$metrics |> select(model, .metric, std_err) |>
+  pivot_wider(names_from = .metric, values_from = std_err)
+m_clf  <- clf$metrics |> select(model, .metric, mean) |>
+  pivot_wider(names_from = .metric, values_from = mean)
+se_clf <- clf$metrics |> select(model, .metric, std_err) |>
+  pivot_wider(names_from = .metric, values_from = std_err)
+
+get_reg <- function(model, metric) {
+  if (metric %in% names(m_reg)) return(m_reg[[metric]][m_reg$model == model])
+  se_reg[[metric]][se_reg$model == model]
+}
+get_clf <- function(model, metric) {
+  if (metric %in% names(m_clf)) return(m_clf[[metric]][m_clf$model == model])
+  se_clf[[metric]][se_clf$model == model]
+}
+
+term_lab <- c(
+  log_pop        = "log population",
+  log_inc        = "log median household income",
+  log_hv         = "log median home value",
+  log_dens       = "log population density",
+  owner_share    = "owner-occupied share",
+  mf_stock_share = "multifamily share of stock",
+  med_year_built = "median year built"
+)
+
+n_towns   <- nrow(d)
+n_zero    <- sum(d$permits_per_1000 == 0)
+n_permits <- sum(d$perm_total)
+```
+
+# Introduction
+
+Maine has a housing shortage, and the state has only recently started requiring
+towns to report their building permits every year. That makes permits the earliest
+hard number we have on where new housing is actually being built. Our question is a
+narrow one: which municipal characteristics go with a higher rate of new
+construction?
+
+We did not start there. The first target we tried was the total number of permits a
+town issues, and it turned out to be a disappointing one. Permit counts track
+population almost mechanically, so a model of counts mostly recovers how big a town
+is, which we already knew from the population column. We switched to the permit
+rate, permits issued per 1,000 residents, and kept the same candidate predictors:
+median household income, median home value, population density, the owner-occupied
+share, the multifamily share of the housing stock, and the median year the stock was
+built.
+
+The short version of what we found is that home value matters a great deal, income
+does not, and density runs the opposite way from what we expected. On top of
+population, the characteristics roughly double the share of variance explained,
+reaching an R-squared of about 0.25 out of fold, and none of the flexible models we
+tried buys anything over a plain linear model. A smaller second task puts a
+different question to the same towns: which of them permitted any multifamily
+housing at all?
+
+# Dataset
+
+Permit counts come from the 2025 Statewide Housing Data workbook, which combines a
+municipal survey, records from the Land Use Planning Commission, and Census Building
+Permits Survey estimates for the 220 municipalities that did not respond to the
+survey. The characteristics come from the 2020-2024 American Community Survey
+five-year estimates at the county subdivision level, joined to the Census Gazetteer
+for land area. We matched 528 of the 529 workbook municipalities to an ACS
+subdivision; the exception is the aggregate UNORGANIZED TERRITORIES row, which is not
+a single place.
+
+Table 1 lists the variables we use.
+
+```{r}
+#| label: tbl-vars
+#| tbl-cap: "Variables used in the analysis."
+vars <- tribble(
+  ~Variable, ~Source, ~Definition,
+  "Permit rate", "workbook", "Permits issued in 2024 per 1,000 residents",
+  "log population", "ACS B01003", "Total population (log)",
+  "log income", "ACS B19013", "Median household income, dollars (log)",
+  "log home value", "ACS B25077", "Median value of owner-occupied units, dollars (log)",
+  "log density", "ACS + Gazetteer", "Residents per square mile of land (log)",
+  "Owner share", "ACS B25003", "Share of occupied units that are owner-occupied",
+  "Multifamily share", "ACS B25024", "Share of housing units in buildings with 2+ units",
+  "Median year built", "ACS B25035", "Median year the housing stock was built"
+)
+kable(vars, booktabs = TRUE, longtable = FALSE, align = "lll", linesep = "") |>
+  kable_styling(latex_options = "hold_position", font_size = 8) |>
+  column_spec(3, width = "7.0cm")
+```
+
+Two features of the permits are worth spelling out, because they shape everything
+after this. First, a town reports through one of two channels, a local survey or
+Census estimates, and the two do not agree exactly. Across the 169 towns that appear
+in both, the local totals run about 8% above the Census estimate, so we keep the
+reporting channel as a predictor rather than pretending the two series are
+interchangeable. Second, the missingness is structural rather than random. Accessory
+dwelling units and affordable-unit counts exist only for the 182 towns that filled
+in the survey, the Census columns exist wherever the Census publishes them, and 90
+municipalities report nothing at all. Dropping the non-reporting towns and one
+unorganized-territory row with no population leaves 438 towns with a permit count,
+and 419 of those also have the ACS characteristics. That 419 is the sample used
+below.
+
+```{r}
+#| label: fig-dist
+#| fig-cap: "Permit rates across the 419 towns. (a) Permits per 1,000 residents, x-axis truncated at 40 (15% of towns are at zero). (b) Median rate by home-value quintile. (c) Median rate by density quintile."
+#| fig-width: 6.6
+#| fig-height: 1.95
+p_a <- d |>
+  ggplot(aes(x = permits_per_1000)) +
+  geom_histogram(binwidth = 0.5, boundary = 0, fill = "grey35", colour = NA) +
+  coord_cartesian(xlim = c(0, 40), ylim = c(0, 190)) +
+  annotate("text", x = 14, y = 150, hjust = 0, size = 2.4,
+           label = paste0("median ", fmt(median(d$permits_per_1000), 1),
+                          "  mean ", fmt(mean(d$permits_per_1000), 1),
+                          "\n", round(100 * mean(d$permits_per_1000 == 0)),
+                          "% of towns at zero")) +
+  labs(x = "Permits per 1,000 residents", y = "Towns",
+       title = "(a) Permit rate")
+
+q_hv <- d |>
+  mutate(q = cut_number(log_hv, 5)) |>
+  group_by(q) |>
+  summarise(n = n(), med = median(permits_per_1000), .groups = "drop") |>
+  mutate(lab = paste0("Q", row_number()))
+
+p_b <- q_hv |>
+  ggplot(aes(x = lab, y = med)) +
+  geom_col(fill = "grey35", width = 0.7) +
+  geom_text(aes(label = fmt(med, 1)), vjust = -0.4, size = 2.3) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(x = "Home-value quintile", y = "Permits per 1,000",
+       title = "(b) Housing wealth")
+
+q_dens <- d |>
+  mutate(q = cut_number(log_dens, 5)) |>
+  group_by(q) |>
+  summarise(n = n(), med = median(permits_per_1000), .groups = "drop") |>
+  mutate(lab = paste0("Q", row_number()))
+
+p_c <- q_dens |>
+  ggplot(aes(x = lab, y = med)) +
+  geom_col(fill = "grey35", width = 0.7) +
+  geom_text(aes(label = fmt(med, 1)), vjust = -0.4, size = 2.3) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(x = "Density quintile", y = "Permits per 1,000",
+       title = "(c) Density")
+
+p_a + p_b + p_c + plot_layout(widths = c(1.5, 1, 1)) &
+  theme(plot.title = element_text(size = 8.5))
+```
+
+Permit rates vary a lot from town to town. The median town issued
+`r fmt(median(d$permits_per_1000), 1)` permits per 1,000 residents, but the upper
+quartile is `r fmt(quantile(d$permits_per_1000, 0.75), 1)`, the maximum is
+`r fmt(max(d$permits_per_1000), 0)`, and `r round(100 * mean(d$permits_per_1000 == 0))`%
+of towns issued none at all. Panel (b) shows the first pattern we looked at: the
+median rate climbs with housing wealth, from `r fmt(q_hv$med[1], 1)` permits per
+1,000 in the cheapest quintile to `r fmt(q_hv$med[4], 1)` in the fourth, then drops
+back a little. Panel (c) goes the other way, which surprised us. The sparsest
+quintile has the highest rate (`r fmt(q_dens$med[1], 1)`), and the other four are
+close to five.
+
+```{r}
+#| label: fig-geo
+#| fig-cap: "Permit intensity by county. Bars are aggregate permits per 1,000 residents; the dashed line is the statewide rate. Counties are ordered by intensity."
+#| fig-width: 6.6
+#| fig-height: 2.1
+state_rate <- 1000 * n_permits / sum(d$census_population_24)
+
+cty <- d |>
+  group_by(county) |>
+  summarise(permits = sum(perm_total), pop = sum(census_population_24),
+            .groups = "drop") |>
+  mutate(rate = 1000 * permits / pop)
+
+cty |>
+  ggplot(aes(x = fct_reorder(county, rate), y = rate)) +
+  geom_col(fill = "grey35", width = 0.7) +
+  geom_hline(yintercept = state_rate, linetype = "dashed", linewidth = 0.4) +
+  geom_text(aes(label = fmt(rate, 1)), hjust = -0.2, size = 2.3) +
+  coord_flip() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.12))) +
+  labs(x = NULL, y = "Permits per 1,000 residents")
+```
+
+Aggregate rates differ by a factor of six between counties, from
+`r fmt(min(cty$rate), 1)` permits per 1,000 residents in
+`r cty$county[which.min(cty$rate)]` to `r fmt(max(cty$rate), 1)` in
+`r cty$county[which.max(cty$rate)]`. That ranking is not the one we would have
+guessed. The top of the list is rural and inland, and the two most populous counties
+sit in the middle, which is part of why county stays in the model as a control
+rather than as a stand-in for size.
+
+# Methods
+
+Work was done in R with tidymodels; the preprocessing is in `R/data_prep.R` and the
+models in `R/models.R`. The response is $\log(1 + \text{permits per 1,000
+residents})$. Rates cannot be negative, they are skewed hard to the right, and
+`r n_zero` towns issued nothing at all, so we add one before taking logs. On that
+scale an RMSE of 0.8 is roughly a factor of $e^{0.8}$ in the raw rate, which is the
+right way to read the tables below.
+
+We fit each task as a ladder of models, holding the recipe and the resampling fixed
+so that the comparison is fair:
+
+- Size only: OLS of the rate on log population.
+- Size plus county: the same model with 15 county dummies.
+- Characteristics: the seven predictors, no county.
+- Characteristics plus county: the full specification.
+- Ridge and lasso: the same design, with the penalty tuned over 20 values.
+- Random forest (`ranger`), tuning `mtry` and `min_n`.
+- XGBoost, tuning depth, learning rate and `min_n`.
+
+The second task repeats the ladder with a binary outcome, whether the town permitted
+any multifamily unit at all, and scores models by AUC instead of RMSE.
+
+We expected collinearity to be a problem and it was: population and density
+correlate at 0.91, income and home value at 0.65, and variance inflation factors
+reach 8.2 and 7.4. Ridge and lasso are in the ladder as a check on how much of the
+county effect is genuine rather than an artifact of that overlap.
+
+Every model is scored by repeated 10-fold cross-validation with three repetitions,
+with folds stratified on the outcome for the multifamily task. Tuning happens inside
+each resample, so the numbers reported are out of fold and no model has seen its own
+test rows. Fits are cached in `results/*.rds`, so the report can be rebuilt without
+refitting.
+
+The tuning settled on small models: a ridge penalty of 0.0886, a lasso penalty of
+0.0264, a forest with `mtry` 2 and `min_n` 2, and boosting at depth 2 with a
+learning rate of 0.005.
+
+# Results
+
+## Permit rate
+
+```{r}
+#| label: tbl-reg
+#| tbl-pos: "H"
+#| tbl-cap: "Cross-validated performance for the permit-rate regression. The response is log(1 + permits per 1,000); standard errors are over the 30 resamples; the last column compares RMSE with the full OLS model."
+tab <- reg$metrics |>
+  select(model, .metric, mean) |>
+  pivot_wider(names_from = .metric, values_from = mean) |>
+  left_join(reg$metrics |> select(model, .metric, se = std_err) |>
+              pivot_wider(names_from = .metric, values_from = se),
+            by = "model", suffix = c("", "_se")) |>
+  mutate(rel = 100 * (rmse / rmse[model == "Characteristics + county (OLS)"] - 1)) |>
+  transmute(Model = model,
+            `RMSE (SE)` = sprintf("%.3f (%.3f)", rmse, rmse_se),
+            `MAE (SE)`  = sprintf("%.3f (%.3f)", mae, mae_se),
+            `R2 (SE)`   = sprintf("%.3f (%.3f)", rsq, rsq_se),
+            `vs OLS` = if_else(abs(rel) < 0.05, "--", sprintf("%+.1f%%", rel)))
+kable(tab, booktabs = TRUE, longtable = FALSE, align = "lrrrr", linesep = "")
+
+```
+
+Population on its own explains `r round(100 * get_reg("Size only (OLS)", "rsq"))`%
+of the out-of-fold variance. Adding the seven characteristics takes that to
+`r round(100 * get_reg("Characteristics (OLS)", "rsq"))`%, and adding the county
+dummies as well reaches
+`r round(100 * get_reg("Characteristics + county (OLS)", "rsq"))`%, so the
+characteristics roughly double what population buys and county is worth another few
+points on top.
+
+The flexible models do not improve on this. The random forest has the best $R^2$
+(`r fmt(get_reg("Random forest", "rsq"), 3)`), but its RMSE sits inside one standard
+error of the OLS model, and XGBoost comes out slightly worse than OLS. Ridge
+collapses back to OLS (the selected penalty is essentially zero) and lasso keeps
+most of the county dummies at a small penalty, which says the county effects are not
+an artifact of the dummy expansion. Our reading is that on the log scale the
+relationship is close to additive, and a quarter of the variance is roughly the
+ceiling for this feature set.
+
+```{r}
+#| label: tbl-coef
+#| tbl-cap: "Standardised OLS coefficients for the permit rate, per one standard deviation change in each predictor, with 95% intervals. County effects are omitted here but included in the fitted model."
+coef_tab <- reg$std_coef |>
+  filter(term %in% names(term_lab)) |>
+  mutate(ord = match(term, names(term_lab)),
+         Variable = term_lab[term],
+         `Std. coef.` = sprintf("%+.3f", estimate),
+         `95% CI` = sprintf("%+.2f to %+.2f", estimate - 1.96 * std.error,
+                            estimate + 1.96 * std.error),
+         p = if_else(p.value < 0.001, "< 0.001",
+                     formatC(p.value, format = "f", digits = 3))) |>
+  arrange(ord) |>
+  select(Variable, `Std. coef.`, `95% CI`, `p value` = p)
+kable(coef_tab, booktabs = TRUE, longtable = FALSE, align = "lrrr", linesep = "")
+
+```
+
+Home value is the main story. One standard deviation of median home value goes with
+a `r fmt(abs(reg$std_coef$estimate[reg$std_coef$term == "log_hv"]), 2)` standard
+deviation increase in the log permit rate, and in the unstandardised model a doubling
+of home value corresponds to roughly a
+`r fmt(exp(reg$ols_tidy$estimate[reg$ols_tidy$term == "log_hv"] * log(2)), 2)`-fold
+higher rate. Income takes the wrong sign
+(`r fmt(reg$std_coef$estimate[reg$std_coef$term == "log_inc"], 2)`) and cannot be
+separated from zero once home value is in the model, so we do not read anything into
+it. Population and density are both negative and are hard to pull apart; the plain
+way to say it is that, conditional on county and on each other, larger and denser
+towns permit less per resident. The multifamily share of the existing stock is
+positive, which fits the obvious explanation that towns which already have
+apartments keep building them.
+
+```{r}
+#| label: fig-pdp
+#| fig-cap: "Partial dependence of the permit rate on three predictors, from the OLS model (solid) and XGBoost (dashed). Each panel varies one predictor and holds the others at their observed values."
+#| fig-width: 6.6
+#| fig-height: 1.8
+lab_map <- c(log_hv = "log median home value", log_dens = "log population density",
+             log_inc = "log median household income")
+
+pdp_all <- bind_rows(reg$pdp, reg$pdp_ols) |>
+  mutate(value = coalesce(log_hv, log_dens, log_inc),
+         variable = factor(variable, levels = c("log_hv", "log_dens", "log_inc")))
+
+ggplot(pdp_all, aes(x = value, y = pred, linetype = model)) +
+  geom_line(linewidth = 0.6) +
+  facet_wrap(~ variable, scales = "free_x", labeller = as_labeller(lab_map)) +
+  labs(x = NULL, y = "Predicted log(1 + rate)", linetype = NULL) +
+  theme(legend.position = "bottom", strip.text = element_text(size = 7))
+```
+
+Figure 3 is the same result from the other side. The XGBoost curves follow the
+directions of the OLS slopes, but they flatten in the middle of the range and bend
+at the ends, where there are fewer towns to learn from. Home value is the exception
+and stays monotone over almost its whole range. Density is flat above about 100
+residents per square mile and rises only among the emptiest towns.
+
+We checked the fit two ways. The zeros were the first worry: refitting on the
+`r n_towns - n_zero` towns with a strictly positive rate, using a plain
+$\log(\text{rate})$ response, leaves the coefficients in the same direction and
+about the same size (home value 0.72 against 0.99, population -0.39, density -0.24,
+multifamily share 2.00), so the zero towns are not driving the result. The second is
+the reporting channel, discussed above; keeping it in the model means the
+coefficients are conditional on who counted the permits.
+
+## Multifamily housing
+
+The outcome here is binary, so the same predictors and the same resampling are
+scored by AUC rather than RMSE.
+
+```{r}
+#| label: tbl-clf
+#| tbl-cap: "Cross-validated performance for the multifamily classification (mf_any). Sensitivity and specificity are at the 0.5 threshold."
+clf_tab <- clf$metrics |>
+  select(model, .metric, mean) |>
+  pivot_wider(names_from = .metric, values_from = mean) |>
+  left_join(clf$metrics |> select(model, .metric, se = std_err) |>
+              pivot_wider(names_from = .metric, values_from = se),
+            by = "model", suffix = c("", "_se")) |>
+  transmute(Model = model,
+            `AUC (SE)` = sprintf("%.3f (%.3f)", roc_auc, roc_auc_se),
+            `Accuracy (SE)` = sprintf("%.3f (%.3f)", accuracy, accuracy_se),
+            Sensitivity = sprintf("%.2f", sens),
+            Specificity = sprintf("%.2f", spec))
+kable(clf_tab, booktabs = TRUE, longtable = FALSE, align = "lrrrr", linesep = "")
+
+```
+
+Telling apart towns that permitted multifamily housing is much easier than
+explaining the rate; every model lands around AUC `r fmt(mean(m_clf$roc_auc), 2)`.
+What interested us is that the characteristics add nothing. Logistic regression on
+log population alone gets `r fmt(get_clf("Size only (logistic)", "roc_auc"), 3)`,
+and the best of the four full models, `r clf$best_model`, gets
+`r fmt(max(m_clf$roc_auc), 3)`, a difference well inside the noise. Whether a town
+permits any apartments at all is mostly a question of how large it is.
+
+# Discussion
+
+Housing wealth, not household income, is what tracks where Maine builds. That is
+the finding we would lead with, and it is not what we expected going in; income is
+the variable everyone reaches for first. The two correlate at 0.65, so the pair is
+best read together: what looks like a market signal is the value of what is already
+there, not the earning power of the people who live there.
+
+Density running negative is the second finding, and the one we trust least, because
+population and density are nearly the same variable in a state with this settlement
+pattern. We would not want to claim that denser towns build less; the safer claim is
+that the emptiest fifth of towns builds at roughly double the median rate, which is
+consistent with construction on cheap land at the edge of service centers.
+
+The third finding is the ceiling. Even the forest, with every characteristic and 15
+county dummies, explains about a quarter of the out-of-fold variance in the log
+rate, and the flexible models do not beat the additive one. That tells us the
+missing variables are not model capacity; they are zoning, sewer and water capacity,
+buildable land, local politics and the age of the population, none of which the ACS
+publishes at this geography. A quarter of the variance is a real result about how
+much of local permitting is municipal socio-economics rather than a modeling
+failure.
+
+Two limitations we should flag. The sample drops the 90 towns that do not report,
+and those are the smallest places, so what we describe is the permitting behavior
+of towns that build and report rather than of the state as a whole; the 20-odd towns
+with suppressed income or home value sit in the same corner of the sample. And this
+is a single cross-section, so home value is as much an outcome of scarcity as a
+cause of construction, and the coefficients are descriptive contrasts rather than
+effects.
+
+If we did this again we would start from the rate rather than the count, since we
+spent a while modeling a target that turned out to be mostly population. The
+obvious next step is a panel: the state has only a few years of annual reporting so
+far, but once there are more, town fixed effects would absorb the local politics
+that currently sit in the error term.
